@@ -4,18 +4,25 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import json
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 환경 변수 로드
 load_dotenv()
+CLIENT_ID = os.environ.get("NAVER_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
 
-# 경로 설정
-# 경로 설정 (실행 환경에 구애받지 않도록 보정)
+# 경로 설정 (실행 환경 및 클라우드 대응)
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs"
+
+# 필요한 디렉토리 자동 생성
+for d in [DATA_DIR, OUTPUT_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 # UI 설정
 st.set_page_config(page_title="Racing Data Intelligence", layout="wide", initial_sidebar_state="expanded")
@@ -32,6 +39,72 @@ st.markdown("""
 
 st.title("🏇 Racing Market Intel Dashboard")
 st.markdown("네이버 API 기반 경마 데이터 및 연령대별 트렌드 분석")
+
+# --- 네이버 API 수집 로직 통합 ---
+AGE_MAP = {"1": "0-12", "2": "13-18", "3": "19-24", "4": "25-29", "5": "30-34", "6": "35-39", "7": "40-44", "8": "45-49", "9": "50-54", "10": "55-59", "11": "60+"}
+
+def call_naver_api(url, method="GET", body=None):
+    request = urllib.request.Request(url)
+    request.add_header("X-Naver-Client-Id", CLIENT_ID)
+    request.add_header("X-Naver-Client-Secret", CLIENT_SECRET)
+    request.add_header("Content-Type", "application/json")
+    try:
+        if body:
+            response = urllib.request.urlopen(request, data=json.dumps(body).encode("utf-8"))
+        else:
+            response = urllib.request.urlopen(request)
+        if response.getcode() == 200:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        st.error(f"API 호출 오류: {e}")
+    return None
+
+def fetch_trends(keywords, start_date, end_date, ages=None):
+    url = "https://openapi.naver.com/v1/datalab/search"
+    body = {"startDate": start_date, "endDate": end_date, "timeUnit": "date", "keywordGroups": [{"groupName": kw, "keywords": [kw]} for kw in keywords]}
+    if ages: body["ages"] = ages
+    return call_naver_api(url, method="POST", body=body)
+
+def collect_realtime_data():
+    with st.status("🚀 실시간 데이터 수집 중...", expanded=True) as status:
+        keywords = ["경마", "한국마사회", "경마결과", "경마예상", "대상경주"]
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        
+        all_data = []
+        st.write("📊 검색 트렌드 수집 중...")
+        # 전체 및 연령대별 루프 (단축 버전)
+        for age_code, age_label in {**{"0": "Total"}, **AGE_MAP}.items():
+            st.write(f"- {age_label} 데이터 가져오는 중...")
+            ages = [age_code] if age_code != "0" else None
+            res = fetch_trends(keywords, start_date, end_date, ages=ages)
+            if res:
+                for r in res['results']:
+                    for e in r['data']:
+                        all_data.append({"date": e['period'], "keyword": r['title'], "ratio": e['ratio'], "age_group": age_label})
+        
+        if all_data:
+            df = pd.DataFrame(all_data)
+            df.to_csv(OUTPUT_DIR / "racing_trends_age.csv", index=False, encoding='utf-8-sig')
+            st.success("✅ 트렌드 데이터 저장 완료!")
+            
+        st.write("💬 소셜 검색 결과 수집 중...")
+        search_results = []
+        for kw in keywords[:2]: # 시간 관계상 주요 키워드만
+            for dom in ["blog", "news"]:
+                url = f"https://openapi.naver.com/v1/search/{dom}.json?query={urllib.parse.quote(kw)}&display=20"
+                res = call_naver_api(url)
+                if res and 'items' in res:
+                    for item in res['items']:
+                        search_results.append({"keyword": kw, "domain": dom, "title": item['title'].replace("<b>","").replace("</b>",""), "link": item['link'], "description": item['description'].replace("<b>","").replace("</b>",""), "date": item.get('postdate') or item.get('pubDate', '')})
+        
+        if search_results:
+            pd.DataFrame(search_results).to_csv(OUTPUT_DIR / "racing_search_results.csv", index=False, encoding='utf-8-sig')
+            st.success("✅ 소셜 데이터 저장 완료!")
+        
+        status.update(label="✅ 수집 완료! 페이지를 새로고침합니다.", state="complete")
+        st.cache_data.clear()
+        st.rerun()
 
 # 데이터 로드 함수
 # 데이터 로드 함수 (인코딩 보정 및 예외 처리 강화)
@@ -79,10 +152,13 @@ with st.sidebar:
         
         available_ages = trend_df['age_group'].unique().tolist()
         selected_ages = st.multiselect("연령대 필터", options=available_ages, default=["Total", "20-24", "30-34", "40-44", "50-54"])
+        
+        if st.button("🔄 실시간 데이터 다시 수집"):
+            collect_realtime_data()
     else:
-        st.warning("데이터가 없습니다. 수집을 먼저 실행해 주세요.")
-        if st.button("데이터 수집 실행 (collector.py)"):
-            st.info("터미널에서 'python src/collector.py'를 실행해 주세요.")
+        st.error("🚨 수집된 데이터가 없습니다!")
+        if st.button("📡 지금 실시간 데이터 수집하기"):
+            collect_realtime_data()
 
 st.divider()
 
