@@ -5,22 +5,21 @@ import os
 import json
 import urllib.request
 import urllib.parse
-import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# --- 1. 환경 설정 및 API 키 로드 ---
+# --- 1. 환경 설정 ---
 load_dotenv()
 CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID") or os.getenv("NAVER_CLIENT_ID")
 CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET") or os.getenv("NAVER_CLIENT_SECRET")
 
-st.set_page_config(page_title="Naver Market Intel", layout="wide")
+st.set_page_config(page_title="Naver API Debugger", layout="wide")
 
-# --- 2. API 호출 함수 (연령대 파라미터 반영) ---
+# --- 2. API 호출 함수 ---
 @st.cache_data(ttl=3600)
 def call_naver_api(url, method="GET", body=None):
     if not CLIENT_ID or not CLIENT_SECRET:
-        st.error("API Key 설정 오류. .env 혹은 Secrets를 확인하세요.")
+        st.error("API Key가 누락되었습니다.")
         return None
     request = urllib.request.Request(url)
     request.add_header("X-Naver-Client-Id", CLIENT_ID)
@@ -28,8 +27,7 @@ def call_naver_api(url, method="GET", body=None):
     request.add_header("Content-Type", "application/json")
     try:
         response = urllib.request.urlopen(request, data=json.dumps(body).encode("utf-8") if body else None)
-        if response.getcode() == 200:
-            return json.loads(response.read().decode("utf-8"))
+        return json.loads(response.read().decode("utf-8"))
     except Exception as e:
         st.error(f"API 호출 오류: {e}")
         return None
@@ -45,105 +43,116 @@ def fetch_search_trends(keywords, start_date, end_date, selected_ages):
     }
     return call_naver_api(url, method="POST", body=body)
 
-def fetch_search_results(query, domain):
-    url = f"https://openapi.naver.com/v1/search/{domain}.json?query={urllib.parse.quote(query)}&display=50&sort=sim"
-    return call_naver_api(url)
-
-# --- 3. 데이터 가공 및 '기타' 방지 로직 ---
-def process_trend_data(data):
-    if not data or "results" not in data: return pd.DataFrame()
+# --- 3. 데이터 가공 및 오류 추적 로직 ---
+def process_trend_data_with_debug(data):
+    if not data or "results" not in data: 
+        return pd.DataFrame(), "데이터가 비어있거나 형식이 잘못되었습니다."
+    
     rows = []
-    # 인구 가중치 (20대~50대 중심)
+    # 인구 가중치 및 매핑
     weights = {'3': 0.18, '4': 0.22, '5': 0.25, '6': 0.35}
+    age_map = {'1':'10대 미만','2':'10대','3':'20대','4':'30대','5':'40대','6':'50대','7':'60대 이상'}
     
     for result in data["results"]:
         kw = result["title"]
+        if not result["data"]:
+            rows.append({"키워드": kw, "상태": "데이터 없음(누락)"})
+            continue
+
         for entry in result["data"]:
-            # 핵심: age를 무조건 문자열로 변환하여 딕셔너리 키와 일치시킴
-            age_code = str(entry.get("age", "Unknown"))
-            ratio = entry["ratio"]
-            adj_score = ratio * weights.get(age_code, 0.1)
+            raw_age = entry.get("age")
+            ratio = entry.get("ratio", 0)
+            status = "정상"
+            
+            # [1] Age 값 존재 여부 및 타입 체크
+            if raw_age is None:
+                age_code = "Unknown"
+                status = "Age값 누락"
+            else:
+                try:
+                    # '3.0' 또는 3 등의 다양한 입력을 문자열 '3'으로 통일
+                    age_code = str(int(float(raw_age)))
+                except:
+                    age_code = str(raw_age)
+                    status = f"타입변환실패({raw_age})"
+
+            # [2] 매핑 및 가중치 계산
+            age_name = age_map.get(age_code, f"기타(코드:{age_code})")
+            if age_name.startswith("기타") and status == "정상":
+                status = "매핑테이블에 없는 코드"
+                
+            weight = weights.get(age_code, 0.1)
+            adj_score = ratio * weight
             
             rows.append({
-                "날짜": entry["period"], "키워드": kw, "연령대코드": age_code,
-                "검색지수": ratio, "조정점수": adj_score
+                "날짜": entry.get("period"),
+                "키워드": kw,
+                "연령대": age_name,
+                "연령대코드": age_code,
+                "검색지수": ratio,
+                "조정점수": adj_score,
+                "상태": status
             })
     
     df = pd.DataFrame(rows)
-    if not df.empty:
+    if not df.empty and "날짜" in df.columns:
         df["날짜"] = pd.to_datetime(df["날짜"])
-        # 매핑 딕셔너리 (문자열 키)
-        age_map = {'1':'10대 미만','2':'10대','3':'20대','4':'30대','5':'40대','6':'50대','7':'60대 이상'}
-        df["연령대"] = df["연령대코드"].map(age_map).fillna("기타")
-        
-        # 날짜/키워드별 점유율 계산
-        df['daily_total'] = df.groupby(['날짜', '키워드'])['조정점수'].transform('sum')
+        # 정상 데이터만 계산에 참여
+        valid_mask = df["조정점수"].notnull()
+        df.loc[valid_mask, 'daily_total'] = df[valid_mask].groupby(['날짜', '키워드'])['조정점수'].transform('sum')
         df['점유율'] = (df['조정점수'] / df['daily_total']) * 100
-    return df
+        
+    return df, "성공"
 
-def process_search_results(all_results):
-    rows = []
-    for kw, domains in all_results.items():
-        for d_name, data in domains.items():
-            if data and "items" in data:
-                for item in data["items"]:
-                    rows.append({
-                        "키워드": kw, "구분": d_name, 
-                        "제목": item.get("title", "").replace("<b>", "").replace("</b>", ""),
-                        "최저가": pd.to_numeric(item.get("lprice", "0"), errors="coerce") or 0,
-                        "브랜드": item.get("brand", ""), "링크": item.get("link", "")
-                    })
-    return pd.DataFrame(rows)
-
-# --- 4. 메인 UI (사이드바 필터) ---
+# --- 4. 메인 UI ---
 with st.sidebar:
-    st.title("🔍 분석 설정")
-    input_keywords = st.text_input("키워드 (쉼표 구분)", "선풍기, 핫팩")
-    keywords = [k.strip() for k in input_keywords.split(",") if k.strip()]
-    
-    date_range = st.date_input("분석 기간", [datetime.now() - timedelta(days=90), datetime.now()])
-    
-    st.write("**연령대 필터**")
-    age_options = {"20대": "3", "30대": "4", "40대": "5", "50대": "6"}
-    selected_labels = st.multiselect("분석 대상", options=list(age_options.keys()), default=list(age_options.keys()))
-    target_ages = [age_options[label] for label in selected_labels]
-    
-    if st.button("데이터 분석 시작 🔄", use_container_width=True):
+    st.title("🔧 시스템 제어판")
+    if st.button("🔥 캐시 강제 삭제 및 초기화"):
         st.cache_data.clear()
         st.rerun()
 
-# --- 5. 데이터 렌더링 ---
+    input_keywords = st.text_input("분석 키워드", "선풍기, 제습기")
+    keywords = [k.strip() for k in input_keywords.split(",") if k.strip()]
+    
+    date_range = st.date_input("분석 기간", [datetime.now() - timedelta(days=30), datetime.now()])
+    
+    st.write("**분석 연령대**")
+    age_options = {"20대": "3", "30대": "4", "40대": "5", "50대": "6"}
+    selected_labels = st.multiselect("대상", options=list(age_options.keys()), default=list(age_options.keys()))
+    target_ages = [age_options[label] for label in selected_labels]
+
+# --- 5. 결과 출력 ---
 if len(date_range) == 2:
     start_date, end_date = date_range
-    with st.spinner('데이터 수집 중...'):
-        trend_raw = fetch_search_trends(keywords, start_date, end_date, target_ages)
-        trend_df = process_trend_data(trend_raw)
-        
-        search_data = {}
-        for kw in keywords:
-            search_data[kw] = {d: fetch_search_results(kw, d_a) for d, d_a in {"blog":"blog", "shop":"shop", "news":"news"}.items()}
-        search_df = process_search_results(search_data)
+    trend_raw = fetch_search_trends(keywords, start_date, end_date, target_ages)
+    trend_df, msg = process_trend_data_with_debug(trend_raw)
 
     if not trend_df.empty:
-        tab1, tab2, tab3 = st.tabs(["📊 점유율 추이", "🛍️ 쇼핑 분석", "📂 원본 데이터"])
-        
+        tab1, tab2 = st.tabs(["📈 분석 차트", "🕵️ 데이터 디버깅"])
+
         with tab1:
             sel_kw = st.selectbox("키워드 선택", options=trend_df['키워드'].unique())
-            fig = px.area(trend_df[trend_df['키워드'] == sel_kw], x="날짜", y="점유율", color="연령대",
-                          title=f"'{sel_kw}' 연령대별 보정 점유율 (%)",
-                          color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig, use_container_width=True)
-            st.info("💡 인구 가중치가 적용된 점유율입니다. '기타'로 나오면 캐시를 삭제해 주세요.")
+            plot_df = trend_df[(trend_df['키워드'] == sel_kw) & (trend_df['상태'] == "정상")]
             
+            if not plot_df.empty:
+                fig = px.area(plot_df, x="날짜", y="점유율", color="연령대", title=f"'{sel_kw}' 보정 점유율 추이")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("차트를 그릴 수 있는 '정상' 상태의 데이터가 없습니다.")
+
         with tab2:
-            if not search_df.empty:
-                shop_df = search_df[search_df["구분"] == "shop"]
-                fig_price = px.box(shop_df, x="키워드", y="최저가", color="키워드", title="상품 가격대 분포")
-                st.plotly_chart(fig_price, use_container_width=True)
-        
-        with tab3:
-            st.dataframe(trend_df)
-            csv = trend_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("📥 결과 다운로드", data=csv, file_name="market_intel.csv")
+            st.subheader("🕵️ 원본 데이터 상태 분석")
+            st.write("모든 행의 처리 상태를 확인합니다. '기타'로 나온다면 아래 테이블의 **연령대코드**와 **상태**를 확인하세요.")
+            
+            # 상태별 필터링 기능
+            status_filter = st.multiselect("상태별 보기", options=trend_df['상태'].unique(), default=trend_df['상태'].unique())
+            st.dataframe(trend_df[trend_df['상태'].isin(status_filter)], use_container_width=True)
+            
+            st.info("""
+            **주요 오류 원인 가이드:**
+            1. **Age값 누락**: 네이버가 해당 날짜/키워드에 대한 연령 정보를 제공하지 않음 (검색량 미달).
+            2. **매핑테이블에 없는 코드**: 선택한 연령대 외의 코드가 들어옴 (예: 7, 8 등).
+            3. **타입변환실패**: API 응답 값이 숫자가 아닌 특수문자나 예상치 못한 형식을 포함함.
+            """)
     else:
-        st.warning("데이터를 불러오지 못했습니다. API 키와 키워드를 확인하세요.")
+        st.error(f"데이터를 처리할 수 없습니다. (메시지: {msg})")
