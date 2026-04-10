@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import json
+from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -11,9 +12,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 경로 설정
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+# 경로 설정 (실행 환경에 구애받지 않도록 보정)
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / "outputs"
 
 # UI 설정
 st.set_page_config(page_title="Racing Data Intelligence", layout="wide", initial_sidebar_state="expanded")
@@ -32,20 +34,40 @@ st.title("🏇 Racing Market Intel Dashboard")
 st.markdown("네이버 API 기반 경마 데이터 및 연령대별 트렌드 분석")
 
 # 데이터 로드 함수
+# 데이터 로드 함수 (인코딩 보정 및 예외 처리 강화)
 @st.cache_data
 def load_data():
-    trend_path = os.path.join(OUTPUT_DIR, "racing_trends_age.csv")
-    search_path = os.path.join(OUTPUT_DIR, "racing_search_results.csv")
+    trend_path = OUTPUT_DIR / "racing_trends_age.csv"
+    search_path = OUTPUT_DIR / "racing_search_results.csv"
     
-    trend_df = pd.read_csv(trend_path) if os.path.exists(trend_path) else pd.DataFrame()
-    search_df = pd.read_csv(search_path) if os.path.exists(search_path) else pd.DataFrame()
+    debug_log = []
     
-    if not trend_df.empty:
+    def read_csv_with_encoding(path):
+        if not path.exists():
+            debug_log.append(f"❌ '{path.name}' 파일을 찾을 수 없습니다. (경로: {path})")
+            return pd.DataFrame()
+        
+        # 순차적으로 인코딩 시도 (한글 깨짐 방지)
+        for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
+            try:
+                df = pd.read_csv(path, encoding=encoding)
+                debug_log.append(f"✅ '{path.name}' 로드 성공 (인코딩: {encoding}, Shape: {df.shape})")
+                return df
+            except Exception:
+                continue
+        
+        debug_log.append(f"❌ '{path.name}' 로드 실패 (모든 인코딩 시도 실패)")
+        return pd.DataFrame()
+
+    trend_df = read_csv_with_encoding(trend_path)
+    search_df = read_csv_with_encoding(search_path)
+    
+    if not trend_df.empty and 'date' in trend_df.columns:
         trend_df['date'] = pd.to_datetime(trend_df['date'])
         
-    return trend_df, search_df
+    return trend_df, search_df, debug_log
 
-trend_df, search_df = load_data()
+trend_df, search_df, debug_log = load_data()
 
 # 사이드바 설정
 with st.sidebar:
@@ -126,6 +148,12 @@ else:
         else:
             st.write("소셜 검색 결과 데이터가 없습니다.")
 
-# 하단 정보
+# 하단 정보 및 디버깅
 st.sidebar.markdown("---")
+with st.sidebar.expander("🔍 데이터 로드 디버그 정보", expanded=False):
+    for log in debug_log:
+        st.write(log)
+    st.write(f"**BASE_DIR:** `{BASE_DIR}`")
+    st.write(f"**OUTPUT_DIR:** `{OUTPUT_DIR}`")
+
 st.sidebar.write(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
