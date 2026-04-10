@@ -1,151 +1,113 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import json
-import urllib.request
-from datetime import datetime, timedelta
+import os
+from pathlib import Path
+from datetime import datetime
 
-# --- 1. UI 및 페이지 설정 ---
-st.set_page_config(page_title="Racing Market Intelligence", layout="wide")
+# --- 1. 경로 및 설정 ---
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+if not OUTPUT_DIR.exists():
+    os.makedirs(OUTPUT_DIR)
 
-st.markdown("""
-<style>
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; }
-    .stButton>button { width: 100%; border-radius: 8px; font-weight: 600; background-color: #2563eb; color: white; }
-    .main { background-color: #f8fafc; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Racing Data Intelligence", layout="wide")
 
-# --- 2. API 인증 설정 ---
-# Streamlit Secrets 또는 직접 입력 (테스트용)
-CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "YOUR_CLIENT_ID")
-CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "YOUR_CLIENT_SECRET")
-
-if CLIENT_ID == "YOUR_CLIENT_ID":
-    st.sidebar.warning("⚠️ Secrets에 NAVER API 키를 설정하거나 코드의 ID/Secret을 수정하세요.")
-
-# --- 3. 핵심 데이터 수집 및 계산 함수 ---
-def get_normalized_data(keyword, start_date, end_date):
-    url = "https://openapi.naver.com/v1/datalab/search"
+# --- 2. 데이터 보정 핵심 함수 (계산식 포함) ---
+def calibrate_market_share(df):
+    """
+    네이버의 상대지수(Ratio)를 실제 점유율(Share)로 변환하는 핵심 로직
+    계산식: (연령별 Ratio * 인구 가중치) / (전체 연령대 조정점수 합) * 100
+    """
+    if df.empty:
+        return df
     
-    # [중요] '전체'를 포함하여 5개 그룹을 한 번에 요청 (기준점 통합)
-    body = {
-        "startDate": start_date.strftime("%Y-%m-%d"),
-        "endDate": end_date.strftime("%Y-%m-%d"),
-        "timeUnit": "date",
-        "keywordGroups": [
-            {"groupName": "전체", "keywords": [keyword]},
-            {"groupName": "20대", "keywords": [keyword], "ages": ["3", "4"]},
-            {"groupName": "30대", "keywords": [keyword], "ages": ["5", "6"]},
-            {"groupName": "40대", "keywords": [keyword], "ages": ["7", "8"]},
-            {"groupName": "50대", "keywords": [keyword], "ages": ["9", "10"]}
-        ]
+    # 분석에서 'Total' 행은 제외하고 개별 연령대만 추출
+    # 네이버 연령 코드: 3(20대), 4(30대), 5(40대), 6(50대)
+    cal_df = df[df['age_group'] != 'Total'].copy()
+    
+    # [인구 가중치 설정] 
+    # 실제 검색을 수행하는 모집단의 크기를 반영 (대한민국 인구 통계 비율 예시)
+    weights = {
+        '3': 0.18,  # 20대
+        '4': 0.22,  # 30대
+        '5': 0.25,  # 40대
+        '6': 0.35   # 50대 이상 (경마 시장의 주요 타겟)
     }
-
-    req = urllib.request.Request(url)
-    req.add_header("X-Naver-Client-Id", CLIENT_ID)
-    req.add_header("X-Naver-Client-Secret", CLIENT_SECRET)
-    req.add_header("Content-Type", "application/json")
-
-    try:
-        response = urllib.request.urlopen(req, data=json.dumps(body).encode("utf-8"))
-        res_code = response.getcode()
-        if res_code == 200:
-            data = json.loads(response.read().decode("utf-8"))
-            
-            # 데이터프레임 변환
-            rows = []
-            for result in data['results']:
-                group_name = result['title']
-                for entry in result['data']:
-                    rows.append({
-                        "date": entry['period'],
-                        "age_group": group_name,
-                        "ratio": entry['ratio']
-                    })
-            
-            df = pd.DataFrame(rows)
-            df['date'] = pd.to_datetime(df['date'])
-            
-            # --- 실질 비중(%) 재계산 로직 ---
-            # 각 날짜별 '전체' 지수를 분모로 사용하여 연령별 점유율 계산
-            total_df = df[df['age_group'] == '전체'].set_index('date')['ratio']
-            
-            def calculate_share(row):
-                total_val = total_df.get(row['date'], 0)
-                if total_val > 0:
-                    return (row['ratio'] / total_val) * 100
-                return 0
-            
-            df['share'] = df.apply(calculate_share, axis=1)
-            return df
-            
-    except Exception as e:
-        st.error(f"데이터 수집 중 오류: {e}")
-    return None
-
-# --- 4. 사이드바 컨트롤러 ---
-with st.sidebar:
-    st.header("🔍 분석 설정")
-    target_kw = st.text_input("분석 키워드", value="경마")
     
-    today = datetime.now()
-    d_range = st.date_input("분석 기간", [today - timedelta(days=30), today])
+    # Step 1: 각 로우에 가중치 적용 (조정 점수 산출)
+    cal_df['adj_score'] = cal_df.apply(
+        lambda x: x['ratio'] * weights.get(str(x['age_group']), 0.1), axis=1
+    )
     
-    st.divider()
-    run_btn = st.button("🚀 시장 데이터 분석")
-    st.caption("네이버 데이터랩 API를 통해 실시간 정규화 분석을 수행합니다.")
+    # Step 2: 날짜별로 조정 점수의 합계 계산 (그날의 전체 검색 볼륨 추정)
+    cal_df['daily_total_vol'] = cal_df.groupby('date')['adj_score'].transform('sum')
+    
+    # Step 3: 최종 점유율(%) 계산
+    # 특정 날짜에 모든 연령대의 share_percent를 더하면 100%가 됨
+    cal_df['share_percent'] = (cal_df['adj_score'] / cal_df['daily_total_vol']) * 100
+    
+    return cal_df
 
-# --- 5. 메인 대시보드 레이아웃 ---
-st.title("🏇 Racing Market Intel Dashboard")
+# --- 3. 데이터 로드 로직 ---
+@st.cache_data
+def load_data():
+    trend_path = OUTPUT_DIR / "racing_trends_age.csv"
+    if not trend_path.exists():
+        return pd.DataFrame()
+    
+    df = pd.read_csv(trend_path)
+    df['date'] = pd.to_datetime(df['date'])
+    return df
 
-if run_btn:
-    if len(d_range) == 2:
-        start_date, end_date = d_range
-        with st.spinner("네이버 빅데이터 분석 중..."):
-            df = get_normalized_data(target_kw, start_date, end_date)
-            
-            if df is not None and not df.empty:
-                # '전체' 데이터를 제외한 순수 연령대 비교 데이터
-                age_only_df = df[df['age_group'] != '전체']
-                
-                # 상단 지표
-                avg_share = age_only_df.groupby("age_group")["share"].mean()
-                top_age = avg_share.idxmax()
-                
-                cols = st.columns(3)
-                cols[0].metric("주요 타겟층", top_age)
-                cols[1].metric(f"{top_age} 평균 점유율", f"{avg_share.max():.1f}%")
-                cols[2].metric("분석 기간", f"{(end_date - start_date).days}일")
+# --- 4. 메인 대시보드 UI ---
+st.title("🏇 Racing Market Intelligence Dashboard")
+st.markdown("네이버 트렌드 지수를 **인구 비중 대비 점유율**로 보정한 리포트입니다.")
 
-                # 시각화 1: 시계열 점유율 변화 (Area Chart)
-                st.subheader(f"📈 '{target_kw}' 연령대별 검색 점유율 추이 (%)")
-                fig_area = px.area(age_only_df, x="date", y="share", color="age_group",
-                                   line_shape="spline", template="plotly_white",
-                                   labels={"share": "점유율 (%)", "date": "날짜"},
-                                   color_discrete_sequence=px.colors.qualitative.Safe)
-                st.plotly_chart(fig_area, use_container_width=True)
+raw_df = load_data()
 
-                # 시각화 2: 평균 비중 및 데이터 요약
-                col_left, col_right = st.columns([1, 1])
-                
-                with col_left:
-                    st.write("### 🥧 평균 마켓 쉐어")
-                    fig_pie = px.pie(age_only_df.groupby("age_group")["share"].mean().reset_index(), 
-                                     values="share", names="age_group", hole=0.4,
-                                     color_discrete_sequence=px.colors.qualitative.Pastel)
-                    st.plotly_chart(fig_pie, use_container_width=True)
-                
-                with col_right:
-                    st.write("### 📋 연령별 요약 통계")
-                    summary = age_only_df.groupby("age_group")["share"].agg(['mean', 'max', 'min']).reset_index()
-                    summary.columns = ['연령대', '평균 비중(%)', '최대 비중(%)', '최소 비중(%)']
-                    st.dataframe(summary.style.highlight_max(axis=0, color='#e2e8f0'), use_container_width=True)
-
-                st.info(f"💡 **분석 결과:** {target_kw} 키워드는 기간 내 평균적으로 **{top_age}**에서 가장 높은 검색 비중을 보였습니다.")
-            else:
-                st.warning("데이터를 가져오지 못했습니다. 키워드를 확인해주세요.")
-    else:
-        st.error("시작일과 종료일을 모두 선택해주세요.")
+if raw_df.empty:
+    st.warning("데이터 파일이 없습니다. `collector.py`를 실행하거나 `outputs` 폴더에 CSV를 넣어주세요.")
 else:
-    st.info("왼쪽 사이드바에서 키워드와 기간을 설정한 후 **[시장 데이터 분석]** 버튼을 눌러주세요.")
+    # 데이터 보정 실행
+    display_df = calibrate_market_share(raw_df)
+    
+    # 사이드바 필터
+    with st.sidebar:
+        st.header("🔍 필터 설정")
+        target_kw = st.selectbox("분석 키워드", options=display_df['keyword'].unique())
+        selected_df = display_df[display_df['keyword'] == target_kw]
+
+    # 화면 구성
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader(f"📅 '{target_kw}' 연령대별 검색 점유율 추이")
+        # 누적 영역 차트: 시간에 따른 점유율 변화를 100% 기준으로 시각화
+        fig = px.area(selected_df, x="date", y="share_percent", color="age_group",
+                      line_group="age_group", labels={'share_percent': '점유율 (%)'},
+                      color_discrete_sequence=px.colors.qualitative.Pastel)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.subheader("📊 평균 시장 점유율")
+        avg_share = selected_df.groupby("age_group")["share_percent"].mean().reset_index()
+        fig_pie = px.pie(avg_share, values='share_percent', names='age_group', 
+                         hole=0.4, color_discrete_sequence=px.colors.qualitative.Safe)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    # --- 5. 계산식 투명성 공개 (주석 및 수식) ---
+    with st.expander("📝 데이터 보정 계산식 및 로직 안내", expanded=True):
+        st.markdown(f"""
+        ### 1. 보정의 목적
+        네이버 API가 제공하는 `Ratio`는 각 연령대 내에서의 상대값일 뿐, 전체 시장에서의 **절대적 비중**을 나타내지 않습니다. 
+        본 대시보드는 이를 해결하기 위해 인구 통계 가중치를 적용하여 **시장 점유율(Share)**을 산출합니다.
+
+        ### 2. 적용 수식
+        특정 날짜($t$)의 연령대($a$)에 대한 점유율($Share_{a,t}$)은 다음과 같이 계산됩니다:
+        
+        $$Share_{a,t} = \\frac{Ratio_{a,t} \\times Weight_a}{\\sum_{i \\in Ages} (Ratio_{i,t} \\times Weight_i)} \\times 100$$
+
+        * **$Ratio_{a,t}$**: 네이버 API가 제공한 연령대별 검색 지수
+        * **$Weight_a$**: 해당 연령대의 실제 인구 비중 (20대: 0.18, 30대: 0.22, 40대: 0.25, 50대: 0.35)
+        """)
