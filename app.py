@@ -8,6 +8,27 @@ import json
 import os
 import re
 import io
+import sys
+import types
+
+# --- 0. 호환성 패치 (Python 3.12+ 에서 제거된 distutils 대응) ---
+try:
+    from distutils.version import LooseVersion
+except ImportError:
+    try:
+        from packaging.version import Version as LooseVersion
+    except ImportError:
+        class LooseVersion:
+            def __init__(self, vstring): self.vstring = vstring
+            def __lt__(self, other): return self.vstring < other.vstring
+    
+    d_mod = types.ModuleType("distutils")
+    dv_mod = types.ModuleType("distutils.version")
+    dv_mod.LooseVersion = LooseVersion
+    d_mod.version = dv_mod
+    sys.modules["distutils"] = d_mod
+    sys.modules["distutils.version"] = dv_mod
+
 import koreanize_matplotlib
 import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import TfidfVectorizer
