@@ -16,11 +16,44 @@ try:
     from distutils.version import LooseVersion
 except ImportError:
     try:
-        from packaging.version import Version as LooseVersion
+        from packaging.version import Version
     except ImportError:
-        class LooseVersion:
-            def __init__(self, vstring): self.vstring = vstring
-            def __lt__(self, other): return self.vstring < other.vstring
+        Version = None
+
+    class LooseVersion:
+        def __init__(self, vstring):
+            self.vstring = vstring
+            self.version = Version(vstring) if Version else vstring
+        
+        def __lt__(self, other):
+            if Version:
+                target = Version(other) if isinstance(other, str) else other
+                return self.version < target
+            return self.vstring < str(other)
+        
+        def __le__(self, other):
+            if Version:
+                target = Version(other) if isinstance(other, str) else other
+                return self.version <= target
+            return self.vstring <= str(other)
+
+        def __gt__(self, other):
+            if Version:
+                target = Version(other) if isinstance(other, str) else other
+                return self.version > target
+            return self.vstring > str(other)
+
+        def __ge__(self, other):
+            if Version:
+                target = Version(other) if isinstance(other, str) else other
+                return self.version >= target
+            return self.vstring >= str(other)
+
+        def __eq__(self, other):
+            if Version:
+                target = Version(other) if isinstance(other, str) else other
+                return self.version == target
+            return self.vstring == str(other)
     
     d_mod = types.ModuleType("distutils")
     dv_mod = types.ModuleType("distutils.version")
